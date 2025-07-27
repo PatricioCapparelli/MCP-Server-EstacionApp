@@ -19,31 +19,55 @@ tools.set("analizar-estacionamiento", {
       return {
         content: [{
           type: "text",
-          text: "No se encontraron estacionamientos disponibles en la zona."
+          text: "🚫 No se encontraron estacionamientos disponibles en la zona."
         }]
       };
     }
 
-    const prompt = `Como experto en tránsito de CABA, analiza estos estacionamientos:
+    // Procesamiento previo de datos
+    const estacionamientos = data.instancias.map(est => {
+      const contenido = est.contenido.contenido.reduce((acc, item) => {
+        acc[item.nombreId] = item.valor;
+        return acc;
+      }, {});
+      
+      return {
+        ...est,
+        detalles: contenido
+      };
+    });
+
+    const prompt = `Como experto en tránsito de CABA, analiza estos estacionamientos en formato claro y estructurado:
+
+**Datos generales:**
 - Total encontrados: ${data.total}
-- Disponibles: ${data.totalFull}
+- Disponibles para estacionar: ${data.totalFull}
 
-Detalles por estacionamiento:
-${data.instancias.map((est, i) => `
-${i + 1}. ${est.nombre || 'Sin nombre'}
-- Dirección: ${est.domicilio || 'No especificada'}
-- Tarifa: ${est.tarifa || 'No especificada'}
-- Capacidad: ${est.capacidad || '?'}
-- Disponibles: ${est.disponibles || '?'}
-`).join('')}
+**Detalle por ubicación:**
+${estacionamientos.map((est, i) => {
+  const calle = est.detalles.calle || 'Calle no especificada';
+  const altura = est.detalles.altura || 'S/N';
+  const permiso = est.detalles.permiso || 'Sin datos';
+  const horario = est.detalles.horario || 'Sin horario';
+  const lado = est.detalles.lado || '';
+  const distancia = est.distancia || 'N/D';
 
-Responde con:
-1. RESUMEN: 1 línea con disponibilidad general
-2. RECOMENDACIÓN: Estacionamiento más conveniente
-3. ADVERTENCIAS: Si hay restricciones importantes
-4. DETALLES: Info adicional relevante
-5. CALLES: direcciones de calles donde esta permitido o prohibido`;
+  return `
+📍 ${i + 1}. ${calle} ${altura} (${lado})
+- Tipo: ${permiso}
+- Horario: ${horario}
+- Distancia: ${distancia} metros
+`;
+}).join('')}
 
+**Formato requerido para la respuesta:**
+1. 🅿️ RESUMEN: Breve resumen de disponibilidad
+2. ✅ UBICACIONES PERMITIDAS: Lista clara de calles y horarios donde se puede estacionar
+3. 🚫 RESTRICCIONES: Zonas prohibidas o con limitaciones
+4. 💡 RECOMENDACIÓN: Mejor opción basada en distancia y disponibilidad
+5. 📌 OBSERVACIONES: Cualquier dato adicional relevante
+
+**Sé conciso pero preciso, usando emojis para mejor legibilidad.**`;
 
     try {
       const response = await openai.chat.completions.create({
@@ -51,7 +75,7 @@ Responde con:
         messages: [
           {
             role: "system",
-            content: "Eres un asistente especializado en movilidad urbana de Buenos Aires. Sé conciso pero útil."
+            content: "Eres un asistente especializado en movilidad urbana de Buenos Aires. Proporciona información clara y estructurada con emojis relevantes."
           },
           { role: "user", content: prompt }
         ],
@@ -62,27 +86,44 @@ Responde con:
       console.log("Análisis generado:", analysis);
 
       return {
-        content: [{ type: "text", text: analysis }]
+        content: [{ type: "text", text: analysis }],
+        metadata: {
+          totalEstacionamientos: data.total,
+          estacionamientosPermitidos: estacionamientos.filter(e => 
+            e.detalles.permiso?.includes('PERMITIDO')).length,
+          estacionamientosProhibidos: estacionamientos.filter(e => 
+            e.detalles.permiso?.includes('PROHIBIDO')).length
+        }
       };
     } catch (error) {
       console.error("Error con OpenAI:", error);
       return {
         content: [{
           type: "text",
-          text: `⚠️ Error al analizar: ${error.message}`
-        }]
+          text: `⚠️ Error al analizar los estacionamientos: ${error.message}`
+        }],
+        error: true
       };
     }
   }
 });
 
 const app = express();
-app.use(bodyParser.json({ limit: '10mb' })); // Aumentamos el límite para JSON grandes
+app.use(bodyParser.json({ limit: '10mb' }));
 
 // Middleware para loggear requests
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
+});
+
+// Middleware para manejo de errores
+app.use((err, req, res, next) => {
+  console.error('Error no manejado:', err);
+  res.status(500).json({ 
+    error: "Error interno del servidor",
+    detalle: err.message 
+  });
 });
 
 app.post("/mcp-tool/:toolName", async (req, res) => {
@@ -94,7 +135,16 @@ app.post("/mcp-tool/:toolName", async (req, res) => {
 
   if (!input || !input.data) {
     return res.status(400).json({ 
-      error: "Formato incorrecto. Se espera { input: { data: {...} } }" 
+      error: "Formato incorrecto. Se espera { input: { data: {...} } }",
+      ejemplo: {
+        input: {
+          data: {
+            instancias: [],
+            total: 0,
+            totalFull: 0
+          }
+        }
+      }
     });
   }
 
@@ -110,31 +160,80 @@ app.post("/mcp-tool/:toolName", async (req, res) => {
     const result = await tools.get(toolName).handler(input);
     console.log(`Tiempo de procesamiento: ${Date.now() - startTime}ms`);
     
-    res.json(result);
+    res.json({
+      success: true,
+      ...result
+    });
   } catch (err) {
     console.error("Error en handler:", err);
     res.status(500).json({ 
       error: "Error interno al procesar la solicitud",
-      detalle: err.message 
+      detalle: err.message,
+      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
     });
   }
 });
 
-// Health check
+// Health check mejorado
 app.get('/health', (req, res) => {
-  res.json({ 
+  const health = {
     status: 'OK',
     tools: Array.from(tools.keys()),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memoryUsage: process.memoryUsage(),
+    env: process.env.NODE_ENV
+  };
+  
+  res.json(health);
+});
+
+// Endpoint de ejemplo
+app.get('/ejemplo', (req, res) => {
+  res.json({
+    description: "Ejemplo de estructura esperada",
+    request: {
+      method: "POST",
+      url: "/mcp-tool/analizar-estacionamiento",
+      body: {
+        input: {
+          data: {
+            instancias: [
+              {
+                nombre: "Permitido estacionar 24 horas",
+                contenido: {
+                  contenido: [
+                    { nombreId: "calle", valor: "ECHAGUE, PEDRO" },
+                    { nombreId: "altura", valor: "1301-1400" },
+                    { nombreId: "permiso", valor: "PERMITIDO ESTACIONAR" },
+                    { nombreId: "horario", valor: "24 HORAS" },
+                    { nombreId: "lado", valor: "derecho" }
+                  ]
+                },
+                distancia: "4.85"
+              }
+            ],
+            total: 1,
+            totalFull: 1
+          }
+        }
+      }
+    }
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`
-  🚀 Servidor listo en http://localhost:${PORT}
-  Herramientas disponibles:
+  🚀 Servidor MCP listo en http://localhost:${PORT}
+  
+  Endpoints disponibles:
   - POST /mcp-tool/analizar-estacionamiento
   - GET /health
+  - GET /ejemplo
+  
+  Variables de entorno requeridas:
+  - OPENROUTER_API_KEY
+  - PORT (opcional)
   `);
 });
